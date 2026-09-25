@@ -497,3 +497,209 @@ AiEvalRunner
 5. Duyệt tiêu chí “không giảm output”: eval nội dung phải bằng hoặc tốt hơn trước khi bật.
 6. Duyệt việc chỉ triển khai sau khi shadow routing và bộ regression đạt yêu cầu.
 
+## 16. Các tối ưu bổ sung để giảm token nhưng nâng chất lượng output
+
+Các tối ưu dưới đây nên được triển khai cùng Hybrid RAG. Chúng giảm phần dữ liệu model phải đọc, đồng thời chuyển các phép tính và kiểm tra quan trọng về backend để câu trả lời ổn định hơn.
+
+### 16.1 Tách câu trả lời thành `Facts` và `Narrative`
+
+Backend tạo một `AnswerFacts` chuẩn hóa trước khi gọi model:
+
+```json
+{
+  "period": {"from": "2026-09-01", "to": "2026-09-25"},
+  "totals": {},
+  "rankings": [],
+  "changes": [],
+  "risks": [],
+  "dataQuality": [],
+  "recommendedActions": []
+}
+```
+
+- `Facts` do SQL và rule engine tính, không dùng model tính lại.
+- `Narrative` do model diễn giải từ `Facts` đã cô đọng.
+- Bảng, chart, tiền, tỷ lệ và nhãn được UI render từ dữ liệu có cấu trúc, không cần model viết lại toàn bộ.
+- Model tập trung vào kết luận, nguyên nhân, rủi ro và hành động nên output có giá trị hơn dù input nhỏ hơn.
+
+Với câu hỏi chỉ yêu cầu bảng xếp hạng hoặc tổng số, backend có thể trả lời trực tiếp mà không gọi model. Nếu người dùng yêu cầu “phân tích”, “nhận định”, “đề xuất”, pipeline mới gọi model để viết narrative.
+
+### 16.2 Dùng `Insight Engine` xác định tín hiệu trước khi gọi model
+
+Thêm lớp tính toán các tín hiệu có thể kiểm chứng:
+
+- Tăng/giảm so với kỳ trước và mức đóng góp vào biến động.
+- Mức tập trung top 3/top 5/top 10.
+- Biên lợi nhuận thấp, trả hàng cao, công nợ cao.
+- Khách mua giảm, ngừng mua, mới phát sinh hoặc có cơ hội bán chéo.
+- Sale, vùng, khách hàng và sản phẩm lệch đáng kể so với trung vị hoặc lịch sử.
+
+Model chỉ nhận các tín hiệu đã xếp hạng theo mức ảnh hưởng. Không gửi hàng nghìn dòng rồi yêu cầu model tự tìm bất thường. Cách này vừa giảm token vừa tạo nhận định nhất quán và giải thích được.
+
+Mỗi insight phải kèm:
+
+```text
+metric
+current_value
+comparison_value
+absolute_change
+percentage_change
+contribution
+evidence_ids
+severity
+```
+
+### 16.3 Lập kế hoạch truy vấn không cần model cho intent rõ ràng
+
+Thứ tự router:
+
+1. Semantic/lexical retrieval tìm intent và tool phù hợp.
+2. Nếu confidence cao và tham số đầy đủ, backend lập report plan trực tiếp.
+3. Chỉ gọi model chọn tool khi câu hỏi mơ hồ, kết hợp nhiều nghiệp vụ hoặc cần suy luận ngôn ngữ.
+
+Nhờ đó các câu phổ biến như doanh thu theo khách hàng, nhóm sản phẩm, sale và vùng không tốn một lượt model chỉ để chọn tool. Đây là định tuyến động theo metadata và confidence, không hardcode từng câu hỏi.
+
+### 16.4 Cache theo từng tầng thay vì chỉ cache câu trả lời cuối
+
+Thiết kế bốn loại cache độc lập:
+
+| Cache | Khóa chính | Mục đích |
+|---|---|---|
+| Intent cache | normalized semantic signature | Không phân loại lại câu hỏi tương đồng |
+| Plan cache | intent + parameters + permission | Không lập lại report plan |
+| Report cache | tool + arguments + source version + permission | Không truy vấn và tổng hợp lại cùng báo cáo |
+| Answer cache | facts hash + response contract + language | Không viết lại cùng một kết luận |
+
+Report cache và answer cache phải độc lập. Khi cách trình bày thay đổi nhưng dữ liệu chưa đổi, có thể dùng lại report. Khi dữ liệu đổi, answer cache tự mất hiệu lực qua `facts hash`.
+
+L1 RAM chỉ giữ key và entry nóng với kích thước giới hạn. L2 database giữ cache dùng chung giữa các instance và không mất khi deploy. Không lưu một payload lớn nhiều lần trong RAM.
+
+### 16.5 Tận dụng prompt caching của nhà cung cấp
+
+Đặt phần ổn định ở đầu request theo thứ tự cố định:
+
+1. Core instructions có version.
+2. Output schema.
+3. Tool schema được sắp xếp ổn định.
+4. Nội dung động: knowledge chunk, state, câu hỏi và facts.
+
+Không chèn timestamp, request ID hoặc nội dung thay đổi vào phần prefix ổn định. Audit phải ghi `cached_input_tokens` để xác nhận cache thực sự hoạt động. Prompt caching chỉ là tối ưu bổ sung; không được dùng để biện minh cho prompt đầu vào quá lớn.
+
+### 16.6 Structured output thay cho văn bản tự do hoàn toàn
+
+Yêu cầu model trả JSON theo schema ngắn:
+
+```json
+{
+  "conclusion": "...",
+  "observations": ["..."],
+  "risks": ["..."],
+  "actions": ["..."],
+  "evidenceIds": ["..."]
+}
+```
+
+Backend/UI chịu trách nhiệm tiêu đề, bảng, chart, định dạng tiền và tỷ lệ. Cách này:
+
+- Tránh model lặp lại nguyên bảng trong phần mô tả.
+- Không sinh HTML/Markdown dài và dễ lỗi.
+- Kiểm tra được mỗi nhận định có evidence hay không.
+- Cho phép render câu trả lời đẹp hơn mà không tăng token output.
+
+Không đặt giới hạn số ý quá thấp. Số observations/actions được chọn động theo số tín hiệu có ý nghĩa và loại câu hỏi.
+
+### 16.7 Field projection và aggregation contract cho từng tool
+
+Mỗi tool khai báo metadata thay vì trả một `safeJson` chung:
+
+```text
+identity fields
+measure fields
+derived fields
+required totals
+quality fields
+model-visible fields
+client-only fields
+default grouping
+maximum model rows
+```
+
+`ResultSummarizer` dựa vào contract để chọn field. Không cắt JSON theo số ký tự vì có thể làm mất trường quan trọng. Tool nhiều dữ liệu phải hỗ trợ aggregation, top N, pagination và export ngay tại SQL/service để tránh N+1 và tránh tạo payload lớn rồi mới cắt.
+
+### 16.8 Delta context cho câu hỏi nối tiếp
+
+Khi người dùng hỏi “còn theo sale thì sao” hoặc “so với tháng trước”, chỉ gửi:
+
+- State hiện tại.
+- Phần tham số thay đổi.
+- ID/hash của facts trước đó nếu vẫn cần so sánh.
+
+Không gửi lại toàn bộ câu hỏi, câu trả lời, tool call và bảng dữ liệu trước. Nếu facts cũ cần dùng, server lấy lại từ report cache bằng ID.
+
+### 16.9 Pre-aggregation cho báo cáo được hỏi thường xuyên
+
+Tạo bảng/tác vụ tổng hợp theo ngày cho các chiều thường dùng:
+
+```text
+date + customer
+date + product
+date + product_group
+date + employee
+date + region
+```
+
+Các bảng tổng hợp lưu doanh thu, giá vốn có độ phủ, lợi nhuận gộp, số lượng và trả hàng. Đây là tối ưu SQL và latency, không phải nguồn số liệu độc lập; phải có quy trình đối soát với giao dịch gốc.
+
+Lợi ích gián tiếp về token: report trả cấu trúc tổng hợp đúng nhu cầu ngay từ đầu, không cần model hoặc backend xử lý danh sách giao dịch dài.
+
+### 16.10 Quality gate theo từng câu trả lời
+
+Tính `AnswerQualityScore` trước khi trả:
+
+```text
+data_completeness
+required_metric_coverage
+evidence_coverage
+calculation_validation
+language_and_label_validation
+action_relevance
+```
+
+Nếu điểm thấp:
+
+- Thiếu dữ liệu: trả số liệu hiện có và chỉ rõ trường/nguồn cần nhân viên sửa.
+- Thiếu trường bắt buộc: bổ sung từ facts/report, không yêu cầu model đoán.
+- Narrative chưa đạt nhưng facts đúng: thực hiện tối đa một lượt repair nhỏ.
+- Model lỗi/timeout: renderer backend vẫn trả bảng, tổng số, cảnh báo và các insight đã tính.
+
+Quality gate giúp việc giảm token không âm thầm làm output kém đi.
+
+### 16.11 Đo hiệu quả theo giá trị câu trả lời, không chỉ token/request
+
+Bổ sung các chỉ số:
+
+- `input_tokens_per_answer_fact`
+- `input_tokens_per_required_metric`
+- `cost_per_successful_answer`
+- `answer_cache_saved_tokens`
+- `report_cache_saved_latency`
+- `unsupported_claim_rate`
+- `missing_required_metric_rate`
+- Tỷ lệ người dùng hỏi lại do câu trước thiếu nội dung.
+
+Một phiên bản chỉ được coi là tốt hơn khi token/chi phí giảm và đồng thời các chỉ số chất lượng không giảm.
+
+## 17. Thứ tự ưu tiên đề xuất
+
+Thứ tự dưới đây tối đa hóa hiệu quả mà không đánh đổi output:
+
+1. `ResultSummarizer` + tool aggregation contract để chặn payload report phình lớn.
+2. `Facts/Narrative` + structured output để model tập trung vào phân tích.
+3. Router top-k và direct plan khi confidence cao để bỏ lượt gọi chọn tool không cần thiết.
+4. Conversation state + delta context để không gửi lại lịch sử và tool output.
+5. Cache nhiều tầng trong database, có source version và permission scope.
+6. Insight Engine để tăng chất lượng nhận định từ dữ liệu đã tính sẵn.
+7. Prompt caching với prefix ổn định.
+8. Pre-aggregation cho các báo cáo có tải cao.
+
+Các hạng mục 1–6 thuộc tiêu chí nghiệm thu chính. Không bật production nếu chi phí giảm nhưng output mất số liệu, cảnh báo, tỷ suất lợi nhuận hoặc hành động điều hành cần thiết.
